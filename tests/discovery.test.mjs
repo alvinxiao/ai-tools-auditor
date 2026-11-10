@@ -98,10 +98,13 @@ test('first successful poll baselines the feed and queues nothing; explicit back
 
 test('canonical feeds with declared media namespace and xml:lang parse; identity fields stay authoritative', () => {
   const parsed = parseFeed(canonicalFeed('fIxTuRe_001'), CHANNEL, { now });
-  assert.deepEqual(parsed.entries, [{ videoId: 'fIxTuRe_001', published: '2026-11-09T15:52:48+00:00' }]);
+  assert.deepEqual(parsed.entries, [
+    { videoId: 'fIxTuRe_001', published: '2026-11-09T15:52:48+00:00', title: `Feed "test' title" & notes` },
+  ]);
   const catalog = catalogWith(CHANNEL);
   const record = Object.values(catalog.channels)[0];
   assert.equal(applyFeed(catalog, record, parsed.entries, { backfill: true, now: Date.parse('2026-11-09T16:00:00Z') }), 1);
+  assert.equal(catalog.videos.fIxTuRe_001.title, `Feed "test' title" & notes`);
 
   const rejected = [
     ['media namespace redeclared on an entry', canonicalFeed('fIxTuRe_001').replace('<media:group>', '<media:group xmlns:media="http://evil.test/mrss/">')],

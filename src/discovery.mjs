@@ -1,7 +1,11 @@
 // Explicit manual channel discovery over YouTube's public Atom feeds.
 // This is preparatory discovery only: catalog.monitoring stays false and no
 // scheduler runs. Feeds are fetched from one fixed URL per validated channel
-// ID; nothing from feed content is ever used as a URL.
+// ID; nothing from feed content is ever used as a URL. A validated
+// top-level entry <title> is stored as display metadata only; missing
+// titles are accepted, and invalid titles reject the feed without mutation.
+
+import { validateTitle } from './titles.mjs';
 
 const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
 const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
@@ -185,6 +189,7 @@ export function parseFeed(raw, expectedChannelId, { now = Date.now() } = {}) {
     if (prefix === 'yt' && name === 'channelId' && stack.length === 1) target = 'channelId';
     else if (prefix === 'yt' && name === 'videoId' && entry && parent === entry.frame) target = 'videoId';
     else if (!prefix && name === 'published' && entry && parent === entry.frame) target = 'published';
+    else if (!prefix && name === 'title' && entry && parent === entry.frame) target = 'title';
     const frame = { name, prefix, target, text: '', hasChildren: false };
     stack.push(frame);
     if (isEntry) {
@@ -212,6 +217,9 @@ export function parseFeed(raw, expectedChannelId, { now = Date.now() } = {}) {
       } else if (frame.target === 'videoId') {
         if (!VIDEO_ID.test(text)) fail('Feed contains an invalid video ID');
         entry.videoIds.push(text);
+      } else if (frame.target === 'title') {
+        try { entry.title = validateTitle(text, 'feed entry title'); }
+        catch (error) { fail(`Feed entry has an invalid title: ${error.message}`); }
       } else if (frame.target === 'published') {
         if (!PUBLISHED.test(text) || !Number.isFinite(Date.parse(text))) {
           fail('Feed entry has an invalid published timestamp');
@@ -263,7 +271,7 @@ export function parseFeed(raw, expectedChannelId, { now = Date.now() } = {}) {
         if (!entry.videoIds.length) fail('Feed entry has no yt:videoId');
         if (new Set(entry.videoIds).size !== 1) fail('Feed entry has conflicting video IDs');
         if (!entry.published) fail('Feed entry has no published timestamp');
-        entries.push({ videoId: entry.videoIds[0], published: entry.published });
+        entries.push({ videoId: entry.videoIds[0], published: entry.published, ...(entry.title === undefined ? {} : { title: entry.title }) });
         entry = null;
       }
       close(false);
@@ -308,7 +316,7 @@ export function applyFeed(catalog, record, entries, { backfill = false, now = Da
   if (!record.initialized && !backfill) {
     for (const { videoId } of entries) seen.add(videoId);
   } else {
-    for (const { videoId } of entries) {
+    for (const { videoId, title } of entries) {
       const exists = Object.hasOwn(catalog.videos, videoId);
       if (!backfill) {
         if (seen.has(videoId)) continue;
@@ -324,6 +332,7 @@ export function applyFeed(catalog, record, entries, { backfill = false, now = Da
         state: 'queued',
         channelId: record.id,
         discoveredAt: timestamp,
+        ...(title === undefined ? {} : { title }),
       };
       queued++;
     }

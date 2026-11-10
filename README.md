@@ -1,4 +1,6 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<p align="center">
+  <img src="assets/tldw-ai-tools.png" width="360" alt="TL;DW AI Tools Edition: an orange cat with a rainbow background">
+</p>
 
 # AI Tools Auditor
 
@@ -20,9 +22,12 @@ The fastest route uses a transcript you already have. You need Git, Node.js 24 o
 
    ```sh
    node src/cli.mjs add "https://www.youtube.com/watch?v=abcdefghijk"
+   node src/cli.mjs metadata abcdefghijk
    node src/cli.mjs transcript abcdefghijk .auditor/transcript.txt
    node src/cli.mjs packet abcdefghijk .auditor/research-packet.json
    ```
+
+   `metadata` fetches the public official oEmbed title for the video and names its record after it. You can skip it or pass a name directly with `add "URL" --title "Some Title"`, or set one later with `title abcdefghijk "Some Title"`.
 
    To fetch captions instead, follow [Retrieve captions with yt-dlp](#retrieve-captions-with-yt-dlp). That path requires Docker and a verified retrieval runtime.
 
@@ -69,7 +74,11 @@ node src/cli.mjs channel remove UC1234567890123456789012
 
 The first successful `discover` records the current feed as a baseline and queues nothing. Later runs queue unseen uploads. `node src/cli.mjs discover --backfill` queues the feed's current entries even on the first run. The feed is finite; IDs already seen stay recorded so an entry that falls out and later reappears is never re-queued, and no complete historical coverage is claimed. A video that already exists keeps its state and transcript. Removing a channel removes only its configuration; queued videos and reports are retained.
 
-Each poll fetches the fixed URL `https://www.youtube.com/feeds/videos.xml?channel_id=<validated ID>` with no cookies, no redirects, a 15-second timeout, and a 1 MiB response limit. A strict minimal Atom parser validates the channel ID, video IDs, and published timestamps and stores no remote titles, which limits injection through feed content. Failed or rejected feeds leave a channel's baseline untouched and appear as failed feeds on `dashboard.md`; other channels' successes still persist. HTTP 429 starts a cooldown (Retry-After, capped at one hour, default 15 minutes) and later runs skip that channel until it ends.
+Each poll fetches the fixed URL `https://www.youtube.com/feeds/videos.xml?channel_id=<validated ID>` with no cookies, no redirects, a 15-second timeout, and a 1 MiB response limit. A strict minimal Atom parser validates the channel ID, video IDs, published timestamps, and the top-level entry `<title>`; titles are stored only as display metadata (missing titles stay backward compatible, and an invalid title rejects the whole feed without any state change), which limits injection through feed content. Failed or rejected feeds leave a channel's baseline untouched and appear as failed feeds on `dashboard.md`; other channels' successes still persist. HTTP 429 starts a cooldown (Retry-After, capped at one hour, default 15 minutes) and later runs skip that channel until it ends.
+
+## Titles and source note filenames
+
+Every video record keeps its exact 11-character YouTube ID as the internal identity for dedupe, packets, and provenance. Titles are display metadata and become the user-facing names: source notes, dashboard links, and report history all use the title, and a missing title shows `Title unavailable` instead of the raw ID (the ID itself stays recorded inside the source note). Filenames are derived from the title as a lowercase ASCII slug, truncated to 80 characters with Windows reserved names like `CON` prefixed (`video-con`); when no safe slug can form, the note falls back to `untitled-video`, `untitled-video-2`, and so on. Duplicate titles get numbered filenames (`name`, `name-2`, ...) and are never merged: they remain separate videos. A source slug is assigned once and stays stable afterwards, so notes are not renamed on refresh; legacy hex-encoded source files are migrated to their titled name in place, preserving personal annotations, and renaming refuses to overwrite an unrelated existing file. The `metadata` command derives its fixed URL only from the validated video ID (`https://www.youtube.com/oembed?...`), sends no cookies or redirects, caps the response at 1 MiB with a 10-second timeout, and stores only a validated single-line title.
 
 ## Retrieve captions with yt-dlp
 

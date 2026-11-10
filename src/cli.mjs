@@ -2,9 +2,11 @@ import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { atomicWrite, readJson, withCatalog } from './store.mjs';
-import { applyImport, exampleAssessment, hash, packet, render, text, validateImport, videoId } from './auditor.mjs';
+import { applyImport, exampleAssessment, hash, packet, planSourceNotes, render, text, validateImport, videoId } from './auditor.mjs';
 import { retrieveTranscript, YT_DLP_VERSION } from './retrieval.mjs';
 import { channelId as parseChannelId, discover, ensureChannels } from './discovery.mjs';
+import { fetchVideoTitle } from './metadata.mjs';
+import { validateTitle } from './titles.mjs';
 
 export async function main(args = process.argv.slice(2)) {
   let state = path.resolve('.auditor');
@@ -14,7 +16,7 @@ export async function main(args = process.argv.slice(2)) {
     state = path.resolve(args[stateIndex + 1]); args.splice(stateIndex, 2);
   }
   const [command, ...rest] = args;
-  if (!command || command === 'help' || command === '--help') return 'Usage: node src/cli.mjs [--state DIR] init [--vault DIR] | profile FILE | add URL | channel add ID | channel list | channel remove ID | discover [--backfill] | retrieve ID | transcript ID FILE | block ID REASON | fail ID REASON | retry ID | packet ID [FILE] | import FILE | status | render | example [ID]';
+  if (!command || command === 'help' || command === '--help') return 'Usage: node src/cli.mjs [--state DIR] init [--vault DIR] | profile FILE | add URL [--title TITLE] | title ID TITLE | metadata ID | channel add ID | channel list | channel remove ID | discover [--backfill] | retrieve ID | transcript ID FILE | block ID REASON | fail ID REASON | retry ID | packet ID [FILE] | import FILE | status | render | example [ID]';
   if (command === 'example') return JSON.stringify(exampleAssessment(rest[0]), null, 2);
   return withCatalog(state, async (catalog, save) => {
     let discoveryResults;
@@ -45,7 +47,7 @@ export async function main(args = process.argv.slice(2)) {
       ensureChannels(catalog);
       discoveryResults = await discover(catalog, { backfill });
     }
-    if (command === 'render') { await render(catalog); return 'Rendered committed catalog.'; }
+    if (command === 'render') { await planSourceNotes(catalog); await save(catalog); await render(catalog); return 'Rendered committed catalog.'; }
     if (command === 'packet') {
       const content = JSON.stringify(await packet(catalog, rest[0]), null, 2);
       if (rest[1]) { await atomicWrite(path.resolve(rest[1]), content + '\n'); return `Research packet: ${path.resolve(rest[1])}`; }
@@ -55,12 +57,25 @@ export async function main(args = process.argv.slice(2)) {
       catalog.profile = text(await readFile(rest[0], 'utf8'), 'profile');
     } else if (command === 'channel' || command === 'discover') {
     } else if (command === 'add') {
+      if (rest.length > 3 || (rest.length > 1 && (rest[1] !== '--title' || rest.length !== 3))) throw new Error('add accepts URL [--title TITLE]');
       const id = videoId(rest[0]);
       if (Object.hasOwn(catalog.videos, id)) return `Already queued: ${id}`;
-      catalog.videos[id] = { id, url: `https://www.youtube.com/watch?v=${id}`, state: 'queued' };
+      const video = { id, url: `https://www.youtube.com/watch?v=${id}`, state: 'queued' };
+      if (rest.length === 3) video.title = validateTitle(rest[2], '--title');
+      catalog.videos[id] = video;
+    } else if (command === 'title') {
+      if (rest.length !== 2) throw new Error('title accepts ID TITLE');
+      const video = Object.hasOwn(catalog.videos, rest[0]) ? catalog.videos[rest[0]] : undefined;
+      if (!video) throw new Error('Unknown video');
+      video.title = validateTitle(rest[1], 'title');
+    } else if (command === 'metadata') {
+      if (rest.length !== 1) throw new Error('metadata accepts ID');
+      const video = Object.hasOwn(catalog.videos, rest[0]) ? catalog.videos[rest[0]] : undefined;
+      if (!video) throw new Error('Unknown video');
+      video.title = (await fetchVideoTitle(rest[0])).title;
     } else if (command === 'import') {
       const assessment = validateImport(await readJson(rest[0]), catalog);
-      if (!applyImport(catalog, assessment)) { await render(catalog); return 'Already imported; rendered catalog.'; }
+      if (!applyImport(catalog, assessment)) { await planSourceNotes(catalog); await save(catalog); await render(catalog); return 'Already imported; rendered catalog.'; }
       await atomicWrite(path.join(state, 'assessments', `${hash(assessment)}.json`), JSON.stringify(assessment, null, 2) + '\n');
     } else if (['retrieve', 'transcript', 'block', 'fail', 'retry'].includes(command)) {
       const video = Object.hasOwn(catalog.videos, rest[0]) ? catalog.videos[rest[0]] : undefined;
@@ -83,6 +98,7 @@ export async function main(args = process.argv.slice(2)) {
       } else if (command === 'retry') { video.state = video.transcript ? 'ready' : 'queued'; delete video.reason; }
       else { video.state = command === 'block' ? 'blocked' : 'failed'; video.reason = text(rest.slice(1).join(' '), 'reason'); }
     } else throw new Error(`Unknown command: ${command}`);
+    await planSourceNotes(catalog);
     await save(catalog);
     try { await render(catalog); }
     catch (error) { throw new Error(`Catalog saved, vault render incomplete. Fix note conflict and run render. ${error.message}`); }

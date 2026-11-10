@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile, readdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { exampleAssessment, sourceId } from '../src/auditor.mjs';
+import { exampleAssessment } from '../src/auditor.mjs';
 
 async function workspace(t) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'auditor-workflow-'));
@@ -39,11 +39,14 @@ test('CLI produces linked notes, merges repeat coverage, preserves annotations a
   const content = await readFile(file, 'utf8');
   assert.match(content, /Keep this personal annotation/);
   assert.match(content, /New synthetic evidence/);
-  assert.match(content, new RegExp(sourceId(video)));
+  assert.match(content, /Sources\/untitled-video\.md/);
+  assert.doesNotMatch(content, /video-[0-9a-f]{22}/);
   assert.equal((await readdir(path.join(vault, 'Tools'))).length, 1);
   assert.equal((await readdir(path.join(vault, 'History'))).length, 2);
   assert.equal((await readdir(path.join(state, 'assessments'))).length, 2);
-  await readFile(path.join(vault, 'Sources', `${sourceId(video)}.md`));
+  const source = await readFile(path.join(vault, 'Sources', 'untitled-video.md'), 'utf8');
+  assert.match(source, /Title unavailable/);
+  assert.match(source, new RegExp(`Video ID: ${video}`));
   const catalog = JSON.parse(await readFile(path.join(state, 'catalog.json')));
   assert.equal(catalog.videos[video].state, 'audited');
   assert.match(await readFile(path.join(vault, 'dashboard.md'), 'utf8'), /synthetic-tool/);
