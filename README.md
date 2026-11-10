@@ -4,6 +4,8 @@
 
 # AI Tools Auditor
 
+The technology is changing fast and there are 100 videos a day on the topic. Filter that list down to what you care about.
+
 Turn YouTube videos about AI tools into sourced recommendations in an Obsidian vault. Compare using, buying, adapting, or building a tool, and keep repeat coverage in one place.
 
 ## Quickstart
