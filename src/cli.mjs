@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { atomicWrite, readJson, withCatalog } from './store.mjs';
 import { applyImport, exampleAssessment, hash, packet, planSourceNotes, render, text, validateImport, videoId } from './auditor.mjs';
 import { retrieveTranscript, YT_DLP_VERSION } from './retrieval.mjs';
+import { parseHtmlTranscript } from './transcripts.mjs';
 import { channelId as parseChannelId, discover, ensureChannels } from './discovery.mjs';
 import { fetchVideoTitle } from './metadata.mjs';
 import { validateTitle } from './titles.mjs';
@@ -16,7 +17,7 @@ export async function main(args = process.argv.slice(2)) {
     state = path.resolve(args[stateIndex + 1]); args.splice(stateIndex, 2);
   }
   const [command, ...rest] = args;
-  if (!command || command === 'help' || command === '--help') return 'Usage: node src/cli.mjs [--state DIR] init [--vault DIR] | profile FILE | add URL [--title TITLE] | title ID TITLE | metadata ID | channel add ID | channel list | channel remove ID | discover [--backfill] | retrieve ID | transcript ID FILE | block ID REASON | fail ID REASON | retry ID | packet ID [FILE] | import FILE | status | render | example [ID]';
+  if (!command || command === 'help' || command === '--help') return 'Usage: node src/cli.mjs [--state DIR] init [--vault DIR] | profile FILE | add URL [--title TITLE] | title ID TITLE | metadata ID | channel add ID | channel list | channel remove ID | discover [--backfill] | retrieve ID | transcript ID FILE [--format text|html] | block ID REASON | fail ID REASON | retry ID | packet ID [FILE] | import FILE | status | render | example [ID]';
   if (command === 'example') return JSON.stringify(exampleAssessment(rest[0]), null, 2);
   return withCatalog(state, async (catalog, save) => {
     let discoveryResults;
@@ -89,12 +90,21 @@ export async function main(args = process.argv.slice(2)) {
         video.state = result.state;
         if (result.transcript) video.transcript = result.transcript;
         if (result.reason) video.reason = result.reason;
-        video.retrieval = { tool: 'yt-dlp', version: YT_DLP_VERSION, attemptedAt: new Date().toISOString(), ...(result.retryAfter ? { retryAfter: result.retryAfter } : {}) };
+        video.retrieval = { tool: 'yt-dlp', version: YT_DLP_VERSION, attemptedAt: new Date().toISOString(), ...(result.retryAfter ? { retryAfter: result.retryAfter } : {}), ...(result.warning ? { warning: result.warning } : {}) };
       } else if (command === 'transcript') {
-        const transcript = await readFile(rest[1], 'utf8');
-        if (Buffer.byteLength(transcript) > 2_000_000) throw new Error('Transcript exceeds 2 MB');
-        if (!transcript.trim()) { delete video.transcript; video.state = 'blocked'; video.reason = 'No usable transcript'; }
-        else { video.transcript = transcript; video.state = 'ready'; delete video.reason; }
+        if (rest.length < 2 || rest.length > 4 || (rest.length > 2 && (rest[2] !== '--format' || !['text', 'html'].includes(rest[3])))) {
+          throw new Error('transcript accepts ID FILE [--format text|html]');
+        }
+        const format = rest[2] === '--format' ? rest[3] : 'text';
+        const raw = await readFile(rest[1], 'utf8');
+        const transcript = format === 'html' ? parseHtmlTranscript(raw) : raw;
+        if (format === 'text' && Buffer.byteLength(transcript) > 2_000_000) throw new Error('Transcript exceeds 2 MB');
+        if (!transcript.trim()) { delete video.transcript; delete video.provenance; video.state = 'blocked'; video.reason = 'No usable transcript'; }
+        else {
+          video.transcript = transcript; video.state = 'ready'; delete video.reason;
+          video.provenance = { method: format === 'html' ? 'supplied-html' : 'supplied-text', importedAt: new Date().toISOString() };
+          if (video.retrieval) { delete video.retrieval.retryAfter; delete video.retrieval.warning; }
+        }
       } else if (command === 'retry') { video.state = video.transcript ? 'ready' : 'queued'; delete video.reason; }
       else { video.state = command === 'block' ? 'blocked' : 'failed'; video.reason = text(rest.slice(1).join(' '), 'reason'); }
     } else throw new Error(`Unknown command: ${command}`);

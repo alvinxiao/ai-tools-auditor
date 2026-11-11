@@ -94,7 +94,7 @@ node src/cli.mjs retrieve abcdefghijk
 node src/cli.mjs packet abcdefghijk .auditor/research-packet.json
 ```
 
-The container runs with your non-root POSIX UID and GID, or UID and GID 1000 on Windows and root hosts. On root POSIX hosts, scratch ownership is assigned to UID and GID 1000. The container has a read-only root, dropped capabilities, resource limits, and a three-minute timeout. Only the verified artifact and a fresh scratch directory are mounted. The vault, host home, account cookies, and Docker socket are unavailable to the retrieval process. Caption retrieval disables automatic configuration, plugins, remote components, and translated subtitle tracks. It tries original English captions and English captions without downloading video or audio. A valid original English track is preferred when both exist.
+The container runs with your non-root POSIX UID and GID, or UID and GID 1000 on Windows and root hosts. On root POSIX hosts, scratch ownership is assigned to UID and GID 1000. The container has a read-only root, dropped capabilities, resource limits, and a three-minute timeout. Only the verified artifact and a fresh scratch directory are mounted. The vault, host home, account cookies, and Docker socket are unavailable to the retrieval process. Caption retrieval disables automatic configuration, plugins, remote components, and translated subtitle tracks. It first requests original English captions without downloading video or audio. A completed, valid, nonempty JSON3 file counts as success even when yt-dlp exits nonzero; a sanitized warning (URLs, query strings, and generated marker text removed) is recorded in the catalog's retrieval metadata. When the first attempt exits successfully but writes no usable captions, exactly one English caption attempt follows. HTTP 429 or other failures never trigger further requests.
 
 Successful retrieval makes the queued video ready for research. Missing captions remain blocked. Other retrieval errors remain failed and retryable. HTTP 429 responses create a 15-minute cooldown rather than immediate repeated requests. No usable transcript is inferred from titles or descriptions.
 
@@ -108,6 +108,14 @@ node src/cli.mjs packet abcdefghijk .auditor/research-packet.json
 ```
 
 In a user-launched research session, ask your agent to process the packet, check current primary sources, and save assessment JSON following its example. The packet includes your profile, known tool identities, and annotations. Transcript and note contents are untrusted source data. The application does not invoke your subscription or a paid API.
+
+You can also import a saved YouTube transcript page instead of pasted text:
+
+```powershell
+node src/cli.mjs transcript abcdefghijk .auditor/transcript.html --format html
+```
+
+The HTML is treated as inert text: only text inside modern `<transcript-segment-view-model>` text spans or legacy `.segment-text` segments is extracted, in order, with entities decoded. Script, style, and comment content is ignored, so markup faked inside them cannot become transcript text. Raw HTML may be at most 5 MB and the decoded transcript at most 2 MB. Truncated or malformed transcript segments are rejected and leave the catalog unchanged; a page with no transcript segments blocks the video instead of inventing one. A successful import records provenance (`supplied-text` or `supplied-html`) and clears any stale retrieval cooldown or warning.
 
 ```powershell
 node src/cli.mjs import .auditor/assessment.json

@@ -23,7 +23,13 @@ export function parseCaptions(content) {
   return lines.join('\n');
 }
 
-export function retrievalArgs({ id, image, artifact, scratch, name, user = '1000:1000' }) {
+function sanitizeWarning(text) {
+  return text.replace(/<!--[\s\S]*?(?:-->|$)/g, ' ').replace(/https?:\/\/\S*/gi, ' ')
+    .replace(/\s+/g, ' ').trim().slice(0, 2000);
+}
+
+export function retrievalArgs({ id, image, artifact, scratch, name, user = '1000:1000', lang = 'en-orig' }) {
+  if (lang !== 'en-orig' && lang !== 'en') throw new Error('Subtitles language must be en-orig or en');
   if (!/^[A-Za-z0-9_-]{11}$/.test(id)) throw new Error('Invalid video ID');
   if (!/^sha256:[a-f0-9]{64}$/.test(image)) throw new Error('Expected inspected image digest');
   if (!/^[1-9]\d*:[1-9]\d*$/.test(user)) throw new Error('Expected non-root numeric UID:GID');
@@ -37,7 +43,7 @@ export function retrievalArgs({ id, image, artifact, scratch, name, user = '1000
     '--workdir', '/output', '--entrypoint', '/usr/bin/python3', image,
     '/runtime/yt-dlp', '--ignore-config', '--no-plugin-dirs', '--no-remote-components',
     '--no-cache-dir', '--no-playlist', '--skip-download', '--write-subs', '--write-auto-subs',
-    '--sub-langs', 'en-orig,en', '--sub-format', 'json3', '--extractor-args', 'youtube:skip=translated_subs', '--js-runtimes', 'node:/usr/local/bin/node',
+    '--sub-langs', lang, '--sub-format', 'json3', '--extractor-args', 'youtube:skip=translated_subs', '--js-runtimes', 'node:/usr/local/bin/node',
     '--paths', '/output', '--output', 'captions.%(ext)s', '--socket-timeout', '15',
     '--retries', '1', '--extractor-retries', '1', '--retry-sleep', '3', '--max-filesize', '2M',
     '--', `https://www.youtube.com/watch?v=${id}`];
@@ -61,6 +67,49 @@ function docker(args, { timeout = 180_000, outputLimit = 256_000 } = {}) {
   });
 }
 
+export async function inspectCaptions(scratch, lang) {
+  if (lang !== 'en-orig' && lang !== 'en') throw new Error('Subtitles language must be en-orig or en');
+  const expected = `captions.${lang}.json3`;
+  for (const entry of await readdir(scratch, { withFileTypes: true })) {
+    if (entry.name !== expected || entry.name.endsWith('.part') || entry.isSymbolicLink()) continue;
+    const file = path.join(scratch, entry.name);
+    const info = await lstat(file);
+    if (!info.isFile() || info.size > CAPTION_LIMIT) throw new Error('Invalid or oversized caption file');
+    const transcript = parseCaptions(await readFile(file, 'utf8'));
+    if (!transcript.trim()) return { state: 'missing' };
+    return { state: 'ready', transcript };
+  }
+  return { state: 'missing' };
+}
+
+function attemptFailure(result) {
+  const message = (result.stderr || result.stdout || '').trim().slice(-3000);
+  if (/\b429\b|Too Many Requests/i.test(message)) return {
+    state: 'blocked',
+    reason: 'YouTube rate limited yt-dlp with HTTP 429. Retry after the cooldown; no cookies were used.',
+    retryAfter: new Date(Date.now() + 15 * 60_000).toISOString(),
+  };
+  throw new Error(`yt-dlp failed: ${message}`);
+}
+
+export async function runCaptionAttempts({ run, inspect }) {
+  let result = await run('en-orig');
+  let inspectResult = await inspect('en-orig');
+  if (inspectResult.state === 'ready') {
+    return { state: 'ready', transcript: inspectResult.transcript,
+      ...(result.code !== 0 ? { warning: sanitizeWarning(result.stderr || result.stdout || '') } : {}) };
+  }
+  if (result.code !== 0) return attemptFailure(result);
+  result = await run('en');
+  inspectResult = await inspect('en');
+  if (inspectResult.state === 'ready') {
+    return { state: 'ready', transcript: inspectResult.transcript,
+      ...(result.code !== 0 ? { warning: sanitizeWarning(result.stderr || result.stdout || '') } : {}) };
+  }
+  if (result.code !== 0) return attemptFailure(result);
+  return { state: 'blocked', reason: 'yt-dlp returned no usable English captions' };
+}
+
 export async function retrieveTranscript(id, { artifact, image = process.env.AUDITOR_RETRIEVAL_IMAGE } = {}) {
   let scratch, name;
   try {
@@ -77,20 +126,11 @@ export async function retrieveTranscript(id, { artifact, image = process.env.AUD
     const user = uid !== 0 ? `${uid}:${gid || 1000}` : '1000:1000';
     if (process.platform !== 'win32' && uid === 0) await chown(scratch, 1000, 1000);
     name = `auditor-captions-${randomUUID()}`;
-    const result = await docker(retrievalArgs({ id, image: inspected.stdout.trim(), artifact, scratch, name, user }));
-    if (result.code !== 0) {
-      const message = (result.stderr || result.stdout).trim().slice(-3000);
-      if (/\b429\b|Too Many Requests/i.test(message)) return { state: 'blocked', reason: 'YouTube rate limited yt-dlp with HTTP 429. Retry after the cooldown; no cookies were used.', retryAfter: new Date(Date.now() + 15 * 60_000).toISOString() };
-      throw new Error(`yt-dlp failed: ${message}`);
-    }
-    const files = (await readdir(scratch)).filter(file => /^captions\.en(?:-orig)?\.json3$/.test(file)).sort((a, b) => Number(b.includes('en-orig')) - Number(a.includes('en-orig')));
-    if (!files.length) return { state: 'blocked', reason: 'yt-dlp returned no usable English captions' };
-    const file = path.join(scratch, files[0]);
-    const info = await lstat(file);
-    if (!info.isFile() || info.size > CAPTION_LIMIT) throw new Error('Invalid or oversized caption file');
-    const transcript = parseCaptions(await readFile(file, 'utf8'));
-    if (!transcript.trim()) return { state: 'blocked', reason: 'yt-dlp returned empty English captions' };
-    return { state: 'ready', transcript };
+    const base = { id, image: inspected.stdout.trim(), artifact, scratch, name, user };
+    return await runCaptionAttempts({
+      run: lang => docker(retrievalArgs({ ...base, lang })),
+      inspect: lang => inspectCaptions(scratch, lang),
+    });
   } catch (error) {
     return { state: 'failed', reason: error.message.replace(/<!--/g, '').slice(0, 4000) };
   } finally {

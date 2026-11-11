@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, writeFile, rm, symlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { parseCaptions, retrievalArgs, retrieveTranscript } from '../src/retrieval.mjs';
+import { parseCaptions, retrievalArgs, retrieveTranscript, runCaptionAttempts, inspectCaptions } from '../src/retrieval.mjs';
 
 test('JSON3 caption parsing joins segments and removes repeated caption lines', () => {
   assert.equal(parseCaptions(JSON.stringify({ events: [
@@ -29,7 +29,10 @@ test('retrieval mounts only scratch and a read-only artifact and disables automa
   for (const flag of ['--ignore-config', '--no-plugin-dirs', '--no-remote-components', '--no-cache-dir', '--skip-download', '--read-only']) assert.ok(args.includes(flag));
   assert.equal(args[args.indexOf('--user') + 1], '1000:1000');
   assert.equal(args[args.indexOf('--pull') + 1], 'never');
-  assert.equal(args[args.indexOf('--sub-langs') + 1], 'en-orig,en');
+  assert.equal(args[args.indexOf('--sub-langs') + 1], 'en-orig');
+  assert.equal(retrievalArgs({ id: 'abcdefghijk', artifact, scratch, image: 'sha256:' + 'a'.repeat(64), name: 'test-container', lang: 'en' })[args.indexOf('--sub-langs') + 1], 'en');
+  assert.throws(() => retrievalArgs({ id: 'abcdefghijk', artifact, scratch, image: 'sha256:' + 'a'.repeat(64), name: 'test-container', lang: 'en-US' }), /en-orig or en/);
+  assert.throws(() => retrievalArgs({ id: 'abcdefghijk', artifact, scratch, image: 'sha256:' + 'a'.repeat(64), name: 'test-container', lang: 'en-orig,en' }), /en-orig or en/);
   assert.equal(args[args.indexOf('--extractor-args') + 1], 'youtube:skip=translated_subs');
   const customUser = retrievalArgs({ id: 'abcdefghijk', artifact, scratch, image: 'sha256:' + 'a'.repeat(64), name: 'test-container', user: '1234:2345' });
   assert.equal(customUser[customUser.indexOf('--user') + 1], '1234:2345');
@@ -49,6 +52,100 @@ test('unverified artifact fails before invoking Docker', async t => {
   assert.equal(result.state, 'failed');
   assert.match(result.reason, /digest mismatch/);
   assert.equal(result.transcript, undefined);
+});
+
+test('caption inspection ignores partial and symlink files and rejects malformed or oversized complete files', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'auditor-inspect-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ready = JSON.stringify({ events: [{ segs: [{ utf8: 'Original line.' }] }] });
+  await writeFile(path.join(root, 'captions.en-orig.json3'), ready);
+  await writeFile(path.join(root, 'captions.en-orig.json3.part'), 'partial');
+  await writeFile(path.join(root, 'captions.en.json3'), ready);
+  let inspect = await inspectCaptions(root, 'en-orig');
+  assert.equal(inspect.state, 'ready');
+  assert.equal(inspect.transcript, 'Original line.');
+  try {
+    await symlink(path.join(root, 'captions.en.json3'), path.join(root, 'captions.en-orig.json3.bak'));
+    assert.ok((await readdir(root, { withFileTypes: true })).some(entry => entry.isSymbolicLink()));
+  } catch { t.skip('symlink creation unavailable'); }
+  inspect = await inspectCaptions(root, 'en-orig');
+  assert.equal(inspect.state, 'ready');
+  await rm(path.join(root, 'captions.en-orig.json3'));
+  inspect = await inspectCaptions(root, 'en-orig');
+  assert.equal(inspect.state, 'missing');
+  inspect = await inspectCaptions(root, 'en');
+  assert.equal(inspect.state, 'ready');
+  await writeFile(path.join(root, 'captions.en.json3'), '{"events":broken');
+  await assert.rejects(() => inspectCaptions(root, 'en'), /Unexpected|Invalid JSON3/);
+  await writeFile(path.join(root, 'captions.en.json3'), 'x'.repeat(2_000_001));
+  await assert.rejects(() => inspectCaptions(root, 'en'), /oversized/);
+  await writeFile(path.join(root, 'captions.en.json3'), '{"events":[]}');
+  inspect = await inspectCaptions(root, 'en');
+  assert.equal(inspect.state, 'missing');
+});
+
+test('orchestration: valid original succeeds with one request even on nonzero exit', async t => {
+  const requests = [];
+  const result = await runCaptionAttempts({
+    run: lang => { requests.push(lang); return { code: lang === 'en-orig' ? 1 : 0, stdout: 'warning <!-- x --> tail https://youtube.com/watch?v=abcdefghijk&t=1', stderr: '' }; },
+    inspect: async lang => lang === 'en-orig' ? { state: 'ready', transcript: 'Original.' } : { state: 'missing' },
+  });
+  assert.deepEqual(requests, ['en-orig']);
+  assert.equal(result.state, 'ready');
+  assert.equal(result.transcript, 'Original.');
+  assert.equal(result.warning, 'warning tail');
+});
+
+test('orchestration: missing original falls back to one English attempt', async t => {
+  const requests = [];
+  const result = await runCaptionAttempts({
+    run: lang => { requests.push(lang); return { code: 0, stdout: '', stderr: '' }; },
+    inspect: async lang => lang === 'en' ? { state: 'ready', transcript: 'English.' } : { state: 'missing' },
+  });
+  assert.deepEqual(requests, ['en-orig', 'en']);
+  assert.equal(result.state, 'ready');
+  assert.equal(result.transcript, 'English.');
+});
+
+test('orchestration: HTTP 429 stops without fallback requests', async t => {
+  const requests = [];
+  const result = await runCaptionAttempts({
+    run: lang => { requests.push(lang); return { code: 1, stdout: '', stderr: 'HTTP Error 429: Too Many Requests' }; },
+    inspect: async () => ({ state: 'missing' }),
+  });
+  assert.deepEqual(requests, ['en-orig']);
+  assert.equal(result.state, 'blocked');
+  assert.match(result.reason, /429/);
+  assert.ok(result.retryAfter);
+});
+
+test('orchestration: nonzero exit without captions fails and never falls back', async t => {
+  const requests = [];
+  await assert.rejects(() => runCaptionAttempts({
+    run: lang => { requests.push(lang); return { code: 2, stdout: '', stderr: 'Some extraction error https://youtube.com/watch?v=abcdefghijk' }; },
+    inspect: async () => ({ state: 'missing' }),
+  }), /yt-dlp failed/);
+  assert.deepEqual(requests, ['en-orig']);
+});
+
+test('orchestration: exit 0 with no captions on both attempts is blocked', async t => {
+  const requests = [];
+  const result = await runCaptionAttempts({
+    run: lang => { requests.push(lang); return { code: 0, stdout: '', stderr: '' }; },
+    inspect: async () => ({ state: 'missing' }),
+  });
+  assert.deepEqual(requests, ['en-orig', 'en']);
+  assert.equal(result.state, 'blocked');
+  assert.match(result.reason, /no usable English captions/);
+});
+
+test('orchestration: nonzero English attempt without captions fails', async t => {
+  const requests = [];
+  await assert.rejects(() => runCaptionAttempts({
+    run: lang => { requests.push(lang); return { code: lang === 'en' ? 1 : 0, stdout: '', stderr: 'ERROR: no subtitles' }; },
+    inspect: async () => ({ state: 'missing' }),
+  }), /yt-dlp failed/);
+  assert.deepEqual(requests, ['en-orig', 'en']);
 });
 
 test('CLI records retrieval configuration failure and discards obsolete transcript', async t => {
